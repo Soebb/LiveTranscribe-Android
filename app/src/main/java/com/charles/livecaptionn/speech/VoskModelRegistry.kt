@@ -132,10 +132,10 @@ class VoskModelRegistry(private val context: Context) {
     suspend fun downloadAndInstall(info: VoskModelInfo): Boolean = withContext(Dispatchers.IO) {
         val urls = candidateUrls(info)
         if (urls.isEmpty()) {
-            errorMap[info.modelName] = "No download URL"
+            setError(info.modelName, "No download URL")
             return@withContext false
         }
-        errorMap.remove(info.modelName)
+        clearError(info.modelName)
         val cacheDir = File(context.cacheDir, "vosk-downloads").apply { mkdirs() }
         val zipFile = File(cacheDir, "${info.modelName}.zip")
         var lastError = "Download failed"
@@ -163,7 +163,7 @@ class VoskModelRegistry(private val context: Context) {
             }
         }
         zipFile.delete()
-        errorMap[info.modelName] = lastError
+        setError(info.modelName, lastError)
         reportProgress(info.modelName, null)
         false
     }
