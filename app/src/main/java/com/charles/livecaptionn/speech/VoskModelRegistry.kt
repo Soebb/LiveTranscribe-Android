@@ -41,7 +41,18 @@ class VoskModelRegistry(private val context: Context) {
 
     /** Last download error keyed by model name, for surfacing in the UI. */
     private val errorMap = ConcurrentHashMap<String, String>()
+    private val errorFlow = MutableStateFlow<Map<String, String>>(emptyMap())
+    val downloadErrors: StateFlow<Map<String, String>> = errorFlow.asStateFlow()
 
+    private fun setError(modelName: String, message: String) {
+        errorMap[modelName] = message
+        errorFlow.value = errorMap.toMap()
+    }
+
+    private fun clearError(modelName: String) {
+        errorMap.remove(modelName)
+        errorFlow.value = errorMap.toMap()
+    }
     init {
         // Asset enumeration and recursive model-directory inspection can block
         // cold startup on devices with large app storage. Load the catalog off
