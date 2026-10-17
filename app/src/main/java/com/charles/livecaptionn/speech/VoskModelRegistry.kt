@@ -42,14 +42,6 @@ class VoskModelRegistry(private val context: Context) {
     /** Last download error keyed by model name, for surfacing in the UI. */
     private val errorMap = ConcurrentHashMap<String, String>()
 
-    /**
-     * Same errors as a flow so the model sheet can render them. Before this the
-     * failure was recorded but never shown, so a failed download looked like a
-     * "Get" button that did nothing (Play review, Oct 2026).
-     */
-    private val errorFlow = MutableStateFlow<Map<String, String>>(emptyMap())
-    val downloadErrors: StateFlow<Map<String, String>> = errorFlow.asStateFlow()
-
     init {
         // Asset enumeration and recursive model-directory inspection can block
         // cold startup on devices with large app storage. Load the catalog off
@@ -127,79 +119,80 @@ class VoskModelRegistry(private val context: Context) {
      * true on success. The caller should observe [downloadProgress] for UI feedback.
      */
     suspend fun downloadAndInstall(info: VoskModelInfo): Boolean = withContext(Dispatchers.IO) {
-        val url = info.downloadUrl
-        if (url.isNullOrBlank()) {
-            setError(info.modelName, "No download URL")
+        val urls = candidateUrls(info)
+        if (urls.isEmpty()) {
+            errorMap[info.modelName] = "No download URL"
             return@withContext false
         }
-        clearError(info.modelName)
-        reportProgress(info.modelName, 0f)
-        try {
-            val cacheDir = File(context.cacheDir, "vosk-downloads").apply { mkdirs() }
-            val zipFile = File(cacheDir, "${info.modelName}.zip")
-            httpClient().newCall(Request.Builder().url(url).build()).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    Log.w("VoskModelRegistry", "Download of ${info.modelName} failed: HTTP ${resp.code} from $url")
-                    val reason = if (resp.code == 404) {
-                        "Download failed (HTTP 404): this model is no longer published"
-                    } else {
-                        "Download failed (HTTP ${resp.code})"
-                    }
-                    setError(info.modelName, reason)
-                    reportProgress(info.modelName, null)
-                    return@withContext false
+        errorMap.remove(info.modelName)
+        val cacheDir = File(context.cacheDir, "vosk-downloads").apply { mkdirs() }
+        val zipFile = File(cacheDir, "${info.modelName}.zip")
+        var lastError = "Download failed"
+        // Try each mirror in turn so a blocked host (e.g. alphacephei.com in
+        // some regions) doesn't require a VPN.
+        for (url in urls) {
+            reportProgress(info.modelName, 0f)
+            try {
+                val error = downloadZip(url, zipFile, info.modelName)
+                if (error != null) {
+                    Log.w("VoskModelRegistry", "Mirror failed ($error): $url")
+                    lastError = error
+                    continue
                 }
-                val body = resp.body ?: run {
-                    setError(info.modelName, "Download failed: empty response")
-                    reportProgress(info.modelName, null)
-                    return@withContext false
-                }
-                val total = body.contentLength().coerceAtLeast(1)
-                body.byteStream().use { input ->
-                    FileOutputStream(zipFile).use { output ->
-                        val buffer = ByteArray(16 * 1024)
-                        var downloaded = 0L
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read <= 0) break
-                            output.write(buffer, 0, read)
-                            downloaded += read
-                            reportProgress(info.modelName, (downloaded.toFloat() / total).coerceIn(0f, 0.9f))
-                        }
+                reportProgress(info.modelName, 0.92f)
+                val targetRoot = File(context.filesDir, "vosk/models").apply { mkdirs() }
+                unzipInto(zipFile, targetRoot, info.modelName)
+                zipFile.delete()
+                reportProgress(info.modelName, null)
+                refresh()
+                return@withContext true
+            } catch (t: Throwable) {
+                Log.w("VoskModelRegistry", "Failed to install ${info.modelName} from $url", t)
+                lastError = t.message ?: t::class.java.simpleName
+            }
+        }
+        zipFile.delete()
+        errorMap[info.modelName] = lastError
+        reportProgress(info.modelName, null)
+        false
+    }
+
+    /** Mirrors first (reachable without a VPN), official server last. */
+    private fun candidateUrls(info: VoskModelInfo): List<String> {
+        val official = info.downloadUrl?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val file = "${info.modelName}.zip"
+        return listOf(
+            "https://huggingface.co/super-boy/vosk-models/resolve/main/$file",
+            "https://hf-mirror.com/super-boy/vosk-models/resolve/main/$file",
+            official
+        )
+    }
+
+    /** Downloads [url] into [zipFile]. Returns null on success or an error message. */
+    private fun downloadZip(url: String, zipFile: File, modelName: String): String? {
+        httpClient().newCall(Request.Builder().url(url).build()).execute().use { resp ->
+            if (!resp.isSuccessful) return "HTTP ${resp.code}"
+            val body = resp.body ?: return "Empty response"
+            val total = body.contentLength().coerceAtLeast(1)
+            body.byteStream().use { input ->
+                FileOutputStream(zipFile).use { output ->
+                    val buffer = ByteArray(16 * 1024)
+                    var downloaded = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        output.write(buffer, 0, read)
+                        downloaded += read
+                        reportProgress(modelName, (downloaded.toFloat() / total).coerceIn(0f, 0.9f))
                     }
                 }
             }
-
-            reportProgress(info.modelName, 0.92f)
-            val targetRoot = File(context.filesDir, "vosk/models").apply { mkdirs() }
-            unzipInto(zipFile, targetRoot, info.modelName)
-            zipFile.delete()
-            reportProgress(info.modelName, null)
-            refresh()
-            true
-        } catch (t: Throwable) {
-            Log.w("VoskModelRegistry", "Failed to install ${info.modelName}", t)
-            setError(info.modelName, describeFailure(t))
-            reportProgress(info.modelName, null)
-            false
         }
-    }
-
-    private fun setError(modelName: String, message: String) {
-        errorMap[modelName] = message
-        errorFlow.value = errorMap.toMap()
-    }
-
-    private fun clearError(modelName: String) {
-        errorMap.remove(modelName)
-        errorFlow.value = errorMap.toMap()
-    }
-
-    private fun describeFailure(t: Throwable): String = when (t) {
-        is java.net.UnknownHostException -> "Download failed: no internet connection"
-        is java.net.SocketTimeoutException -> "Download failed: the connection timed out"
-        is java.io.IOException -> "Download failed: ${t.message ?: "network error"}"
-        else -> "Download failed: ${t.message ?: t::class.java.simpleName}"
+        // Reject block pages / HTML errors served with HTTP 200 (zip magic = "PK").
+        val magic = ByteArray(2)
+        val ok = zipFile.inputStream().use { it.read(magic) == 2 } &&
+            magic[0] == 'P'.code.toByte() && magic[1] == 'K'.code.toByte()
+        return if (ok) null else "Not a zip file"
     }
 
     /** Deletes a downloaded model from disk. Bundled models cannot be deleted. */
